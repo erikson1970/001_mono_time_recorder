@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# recordings files
+recordings/*
+
+# macOS specific files
+.DS_Store   
