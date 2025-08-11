@@ -31,6 +31,7 @@ import signal
 import subprocess
 import sys
 import threading
+import atexit
 import time
 import shutil
 from pathlib import Path
@@ -133,6 +134,47 @@ ERASE_LINE = "\033[K"
 HIDE_CURSOR = "\033[?25l"
 # Escape code to show the cursor
 SHOW_CURSOR = "\033[?25h"
+
+
+class ConsoleLine:
+    """
+    Renders a single status line that can be updated in-place without
+    stomping on normal logs. Call .break_line() before multi-line prints.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._active = False
+        atexit.register(self.finish)
+
+    def update(self, s: str):
+        with self._lock:
+            sys.stdout.write("\r\033[K" + s)
+            sys.stdout.flush()
+            self._active = True
+
+    def break_line(self):
+        """Finish the current UI line so logs start on column 0."""
+        with self._lock:
+            if self._active:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                self._active = False
+
+    def finish(self):
+        # Safety net at process exit
+        self.break_line()
+
+
+class UILogger:
+    def __init__(self, line: ConsoleLine):
+        self._line = line
+        self._lock = threading.Lock()
+
+    def info(self, msg: str):
+        with self._lock:
+            self._line.break_line()
+            print(msg, flush=True)
 
 
 class SessionIO:
@@ -363,6 +405,13 @@ class ContinuousRecorder:
         self._stop_event = threading.Event()
         self._request_stop = False
         self._stream: sd.InputStream | None = None
+        self._ui_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=4)  # latest-only
+        self._ui_stop = threading.Event()
+        self._ui_thread: threading.Thread | None = None
+
+        # Console UI
+        self._ui_line = ConsoleLine()
+        self._log = UILogger(self._ui_line)
 
     # --- add helper ---
     def _epoch_now_from_callback(self, time_info):
@@ -437,10 +486,9 @@ class ContinuousRecorder:
             seg_idx = self._segment_index
             self._segment_index += 1
             self._task_q.put((samples.copy(), self.sr, t0, t1, seg_idx))
-            print(
+            self._log.info(
                 ("\n" if self.spec_freq > 0.0 else "")
-                + f"[INFO] Segment cut ({reason}). idx={seg_idx:04d}  samples:{len(samples)}",
-                flush=True,
+                + f"[INFO] Segment cut ({reason}). idx={seg_idx:04d}  samples:{len(samples)}"
             )
 
     def _force_finalize_current(self):
@@ -451,11 +499,69 @@ class ContinuousRecorder:
             seg_idx = self._segment_index
             self._segment_index += 1
             self._task_q.put((samples.copy(), self.sr, t0, t1, seg_idx))
-            print(
+            self._log.info(
                 f"[INFO] Finalizing current segment and stopping. idx={seg_idx}",
-                flush=True,
             )
         self._request_stop = True
+
+    def _draw_spectrogram_line(self, mono_block: np.ndarray):
+        """
+        Compute a small FFT and render a color bar on the right half of the terminal.
+        This can reuse your existing COLOR_GRADIENT / NUM_BINS helpers.
+        """
+        # ---- your existing spectrogram math, but using mono_block ----
+        # Keep it light: e.g., 1024-point rFFT even if your block is larger
+        N = min(len(mono_block), 2048)
+        if N <= 0:
+            return
+        x = mono_block[-N:]
+        fft_mag = np.abs(np.fft.rfft(x))
+        # Simple log scaling
+        mag = np.log10(fft_mag + 1e-12)
+        mag -= mag.min()
+        if mag.max() > 0:
+            mag /= mag.max()
+        #        print(f"Spectrogram: {mag.max():.2f} peak amplitude")  # Debug print
+        # Downsample to NUM_BINS (use your existing NUM_BINS/global colors)
+        idx = np.linspace(0, len(mag) - 1, num=NUM_BINS, dtype=int)
+        row = mag[idx]
+
+        # Get current terminal width (or reuse your cached RIGHT_HALF_START_COL)
+        width, _ = get_terminal_size()
+        start_col = width // 2
+        # Build right-half line
+        blocks = []
+        for v in row:
+            color = map_amplitude_to_color(v)  # your existing mapping
+            blocks.append(color + " " + RESET)  # RESET_COLOR)  # bg colored cell
+
+        text = " " * start_col + "".join(blocks)
+        self._ui_line.update(text)
+
+    def _ui_loop(self, fps: float = 5.0):
+        period = max(0.02, 1.0 / fps)
+        last = time.perf_counter()
+        buf = None
+        while not self._ui_stop.is_set():
+            # Get the newest available block without blocking
+            try:
+                while True:
+                    buf = self._ui_q.get_nowait()
+                    # print(f"got data ({len(buf)} words) from ui queue")
+            except queue.Empty:
+                pass
+
+            now = time.perf_counter()
+            if buf is not None and (now - last) >= period:
+                try:
+                    # print(f"creating a spectrogram line from {len(buf)} words")
+                    self._draw_spectrogram_line(buf)
+                except Exception as e:
+                    # UI errors must never break recording
+                    pass
+                last = now
+
+            time.sleep(0.02)  # small nap to avoid busy-wait
 
     def show_spectrogram(self, indata, N: int = 1):
         if N <= 0:
@@ -509,7 +615,7 @@ class ContinuousRecorder:
     def _on_audio(self, indata, frames, time_info, status):
         try:
             if status:
-                print(f"[AudioStatus] {status}", file=sys.stderr)
+                self._log.info(f"[AudioStatus] {status}")  # , file=sys.stderr)
 
             # mono = np.ascontiguousarray(indata[:, 0], dtype=np.float32)
             mono = np.array(indata[:, 0], dtype=np.float32, copy=True)
@@ -535,10 +641,10 @@ class ContinuousRecorder:
                 self._total_elapsed >= self.max_total_minutes * 60.0
                 and not self._request_stop
             ):
-                print(
+                self._log.info(
                     ("\n" if self.spec_freq > 0.0 else "")
                     + f"[INFO] Max total time reached ({self.max_total_minutes} min). Forcing split and exit.",
-                    flush=True,
+                    # flush=True,
                 )
                 next_start = block_start_ts + block_duration
                 # Cut if we have enough to form a segment; otherwise just finalize whatever is there
@@ -554,24 +660,36 @@ class ContinuousRecorder:
                 self._eligible_for_split = True
                 self._pause_watch_elapsed = 0.0
                 if not self._pause_notice_printed:
-                    print(
+                    self._log.info(
                         ("\n" if self.spec_freq > 0.0 else "")
                         + f"[INFO] Segment length reached {self.minutes:.2f} min; looking for a pause "
                         f"(≥ {self.pause_seconds:.2f}s, thr={self.threshold}).",
-                        flush=True,
+                        #  flush=True,
                     )
-                    print(
+                    self._log.info(
                         ("\n" if self.spec_freq > 0.0 else "")
                         + f"[INFO] Pause search window: up to {self.max_pause_minutes} minute(s) before forced cut.",
-                        flush=True,
+                        # flush=True,
                     )
                     self._pause_notice_printed = True
 
-            if self.spec_freq > 0.0 and np.random.rand() < self.spec_freq:
+            if self.spec_freq > 0.0 and np.random.rand() < -1:  # self.spec_freq:
                 NN = min(len(indata[:, 0]), 2048)
                 if NN > 0:
                     # Show spectrogram in the console
                     self.show_spectrogram(indata[:NN, 0].copy(), N=NN)
+
+            # Try to push to the UI; drop if busy so we never block audio
+            try:
+                NN = min(len(indata[:, 0]), 2048)
+                if not self._ui_q.empty():
+                    # Remove stale block so UI sees the newest one
+                    while self._ui_q.qsize() > 1:
+                        self._ui_q.get_nowait()
+                # print(f"pushing data ({NN} words) to ui queue")
+                self._ui_q.put_nowait(indata[:NN, 0].copy())
+            except queue.Full:
+                pass
 
             # If eligible, check pause or window expiry
             if self._eligible_for_split:
@@ -590,10 +708,10 @@ class ContinuousRecorder:
 
                 if self._pause_watch_elapsed >= self.max_pause_minutes * 60.0:
                     if not self._pause_expire_notice_printed:
-                        print(
+                        self._log.info(
                             ("\n" if self.spec_freq > 0.0 else "")
                             + "[INFO] Pause search window expired—forcing segment cut.",
-                            flush=True,
+                            #  flush=True,
                         )
                         self._pause_expire_notice_printed = True
                     next_start = block_start_ts + block_duration
@@ -608,9 +726,9 @@ class ContinuousRecorder:
             print(f"[CallbackError] {e}", file=sys.stderr)
 
     def start(self):
-        print("[INFO] Starting writer thread…")
+        self._log.info("[INFO] Starting writer thread…")
         self._writer.start()
-        print("[INFO] Opening input stream…")
+        self._log.info("[INFO] Opening input stream…")
         self._stream = sd.InputStream(
             samplerate=self.sr,
             channels=1,
@@ -621,16 +739,21 @@ class ContinuousRecorder:
         )
         self._reset_active_buffer()
         self._stream.start()
-        print("[INFO] Recording… Press Ctrl+C to stop.")
-        print(
+        self._log.info("[INFO] Recording… Press Ctrl+C to stop.")
+        # Start UI thread
+        self._ui_stop.clear()
+        self._ui_thread = threading.Thread(target=self._ui_loop, name="ui", daemon=True)
+        self._ui_thread.start()
+        self._log.info("[INFO] UI Loop Started.")
+        self._log.info(
             f"[INFO] Config: segment={self.minutes} min, pause>={self.pause_seconds:.2f}s, "
             f"max-pause-window={self.max_pause_minutes} min, sr={self.sr}, blocksize={self.blocksize}, thr={self.threshold}"
         )
-        print(f"[INFO] Output dir: {self.output_dir}")
-        print(f"[INFO] CSV: {self._io.csv_path.name}")
-        print(f"[INFO] MP3 M3U: {self._io.m3u_mp3_path.name}")
+        self._log.info(f"[INFO] Output dir: {self.output_dir}")
+        self._log.info(f"[INFO] CSV: {self._io.csv_path.name}")
+        self._log.info(f"[INFO] MP3 M3U: {self._io.m3u_mp3_path.name}")
         if not self.delete_wav_after_encode:
-            print(f"[INFO] WAV M3U: {self._io.m3u_wav_path.name}")
+            self._log.info(f"[INFO] WAV M3U: {self._io.m3u_wav_path.name}")
 
     def stop(self):
         self._stop_event.set()
@@ -648,7 +771,9 @@ class ContinuousRecorder:
             seg_idx = self._segment_index
             self._segment_index += 1
             self._task_q.put((samples, self.sr, t0, t1, seg_idx))
-            print(f"[INFO] Final segment flushed. idx={seg_idx}", flush=True)
+            self._log.info(
+                f"[INFO] Final segment flushed. idx={seg_idx}"
+            )  # , flush=True)
 
         try:
             self._task_q.join()
@@ -666,7 +791,7 @@ class ContinuousRecorder:
                     break
                 time.sleep(0.5)
         except KeyboardInterrupt:
-            print("\n[INFO] Stopping…")
+            self._log.info("\n[INFO] Stopping…")
             self.stop()
 
 
