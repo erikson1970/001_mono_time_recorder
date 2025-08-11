@@ -40,6 +40,12 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+
+# Prepare the jet colormap
+JET_CMAP = cm.get_cmap("jet")
+
 
 def ts_to_date(ts: float) -> str:  # DDMMYY
     return dt.datetime.fromtimestamp(ts).strftime("%y%m%d")
@@ -101,13 +107,20 @@ COLOR_GRADIENT = generate_color_gradient(256)
 GRADIENT_SIZE = len(COLOR_GRADIENT)
 
 
-def map_amplitude_to_color(amplitude):
+def map_amplitude_to_color(amplitude: float, map: str | None = None) -> str:
     """Maps a normalized amplitude (0-1) to an ANSI color code from the gradient."""
     # Clip amplitude to stay within the 0-1 range
     clipped_amplitude = np.clip(amplitude, 0, 1)
-    # Scale the amplitude to the size of the color gradient
-    color_index = int(clipped_amplitude * (GRADIENT_SIZE - 1))
-    return COLOR_GRADIENT[color_index]
+    if map is None:
+        # Scale the amplitude to the size of the color gradient
+        color_index = int(clipped_amplitude * (GRADIENT_SIZE - 1))
+        return COLOR_GRADIENT[color_index]
+    elif map == "jet":
+        r, g, b, _ = JET_CMAP(clipped_amplitude)  # returns floats 0–1
+        R, G, B = int(r * 255), int(g * 255), int(b * 255)
+        return f"\033[48;2;{R};{G};{B}m"  # ANSI truecolor background
+    else:
+        raise ValueError(f"Unknown color map: {map}")
 
 
 # --- Configuration ---
@@ -304,6 +317,7 @@ class ContinuousRecorder:
         base_filename: str = "segment_~C_~d~t_~l_secs",
         max_total_minutes: float | None = None,
         spectrogram_frequency: float = 0.6,
+        spectrogram_colors: str | None = None,
     ):
         self._epoch0 = None  # UNIX epoch baseline
         self._mono0 = None  # perf_counter baseline
@@ -338,6 +352,7 @@ class ContinuousRecorder:
         self._elapsed_since_start = 0.0
         self._silence_run = 0.0
         self._total_elapsed = 0.0
+        self.spec_colors = spectrogram_colors
 
         self._eligible_for_split = False
         self._pause_watch_elapsed = 0.0
@@ -488,7 +503,7 @@ class ContinuousRecorder:
         # Ensure the line fits the right half of the terminal
         display_width = current_width - right_half_start_col
         for bin_amplitude in downsampled_data[:display_width]:
-            color_code = map_amplitude_to_color(bin_amplitude)
+            color_code = map_amplitude_to_color(bin_amplitude, map=self.spec_colors)
             spectrogram_line += (
                 f"{color_code} "  # Use a space to create the colored block
             )
@@ -732,6 +747,13 @@ def main():
     )
 
     ap.add_argument(
+        "--specrogram-colors",
+        type=str,
+        default=None,
+        help="Color map for spectrogram: 'jet' for truecolor, or None for ANSI gradient (default: None)",
+    )
+
+    ap.add_argument(
         "--list-devices", action="store_true", help="List audio devices and exit"
     )
     ap.add_argument(
@@ -772,6 +794,7 @@ def main():
         base_filename=args.base_filename,
         max_total_minutes=args.max_total_minutes,
         spectrogram_frequency=args.specrogram_frequency,
+        spectrogram_colors=args.specrogram_colors,
     )
 
     def _handle_sig(signum, frame):
