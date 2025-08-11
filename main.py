@@ -20,6 +20,7 @@ Example
 -------
 python segment_recorder.py --minutes 30 --pause-seconds 1.5 --sr 48000 --silence-threshold 0.008
 """
+import math
 
 import argparse
 import datetime as dt
@@ -174,55 +175,68 @@ class ContinuousRecorder:
         return float(np.sqrt(np.mean(np.square(x), dtype=np.float64)))
 
     def _on_audio(self, indata, frames, time_info, status):
-        if status:
-            # Dropouts or overflows will be reported here
-            print(f"[AudioStatus] {status}", file=sys.stderr)
+        try:
+            if status:
+                # Dropouts or overflows will be reported here
+                print(f"[AudioStatus] {status}", file=sys.stderr)
 
-        # indata shape: (frames, channels); we open mono so channels=1
-        mono = np.ascontiguousarray(indata[:, 0], dtype=np.float32)
-        block_start_ts = time_info["input_buffer_adc_time"] or time.time()
+            # indata shape: (frames, channels); we open mono so channels=1
+            mono = np.ascontiguousarray(indata[:, 0], dtype=np.float32)
+            # block_start_ts = time_info["input_buffer_adc_time"] or time.time()
+            t_candidate = getattr(time_info, "inputBufferAdcTime", None)
+            if (
+                t_candidate is None
+                or not math.isfinite(t_candidate)
+                or t_candidate <= 0
+            ):
+                # Fall back if PortAudio time isn’t available yet on this platform/driver
+                block_start_ts = time.monotonic()
+            else:
+                block_start_ts = float(t_candidate)
 
-        # Append to active buffer
-        self._append_block(mono, block_start_ts)
+            # Append to active buffer
+            self._append_block(mono, block_start_ts)
 
-        # Update timers
-        block_duration = frames / self.sr
-        self._elapsed_since_start += block_duration
+            # Update timers
+            block_duration = frames / self.sr
+            self._elapsed_since_start += block_duration
 
-        # After H minutes, watch for pause runs
-        if self._elapsed_since_start >= self.minutes * 60.0:
-            self._eligible_for_split = True
+            # After H minutes, watch for pause runs
+            if self._elapsed_since_start >= self.minutes * 60.0:
+                self._eligible_for_split = True
 
-        # Silence detection
-        block_rms = self._rms(mono)
-        if block_rms < self.threshold:
-            self._silence_run += block_duration
-        else:
-            self._silence_run = 0.0
+            # Silence detection
+            block_rms = self._rms(mono)
+            if block_rms < self.threshold:
+                self._silence_run += block_duration
+            else:
+                self._silence_run = 0.0
 
-        # If eligible and pause run exceeded N seconds, split
-        if self._eligible_for_split and self._silence_run >= self.pause_seconds:
-            collected = self._collect_active()
-            # Start a fresh buffer immediately to avoid gaps
-            next_buffer_start_ts = block_start_ts + block_duration
-            self._reset_active_buffer(t_start=next_buffer_start_ts)
-            self._elapsed_since_start = 0.0
-            self._silence_run = 0.0
-            self._eligible_for_split = False
+            # If eligible and pause run exceeded N seconds, split
+            if self._eligible_for_split and self._silence_run >= self.pause_seconds:
+                collected = self._collect_active()
+                # Start a fresh buffer immediately to avoid gaps
+                next_buffer_start_ts = block_start_ts + block_duration
+                self._reset_active_buffer(t_start=next_buffer_start_ts)
+                self._elapsed_since_start = 0.0
+                self._silence_run = 0.0
+                self._eligible_for_split = False
 
-            if collected:
-                samples, t0, t1 = collected
-                # Queue for writer: keep mono shape (N,) -> (N,1) not needed for WAV; soundfile accepts (N,)
-                self._task_q.put(
-                    (
-                        samples.copy(),
-                        self.sr,
-                        t0,
-                        t1,
-                        self.output_dir,
-                        self.delete_wav_after_encode,
+                if collected:
+                    samples, t0, t1 = collected
+                    # Queue for writer: keep mono shape (N,) -> (N,1) not needed for WAV; soundfile accepts (N,)
+                    self._task_q.put(
+                        (
+                            samples.copy(),
+                            self.sr,
+                            t0,
+                            t1,
+                            self.output_dir,
+                            self.delete_wav_after_encode,
+                        )
                     )
-                )
+        except Exception as e:
+            print(f"[CallbackError] {e}", file=sys.stderr)
 
     def start(self):
         print("[INFO] Starting writer thread…")
@@ -329,6 +343,7 @@ def main():
     ap.add_argument(
         "--delete-wav-after-encode",
         action="store_true",
+        default=False,
         help="Delete WAV after spawning MP3 encode",
     )
     ap.add_argument(
