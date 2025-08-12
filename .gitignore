@@ -14,3 +14,6 @@ recordings/*
 
 # macOS specific files
 .DS_Store   
+
+#developer stuff
+‎.vscode/
