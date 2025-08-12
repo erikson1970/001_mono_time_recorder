@@ -42,9 +42,9 @@ To run the recorder, execute the ```main.py``` script. The program offers a vari
 
 This command records audio, creating segments of approximately 30 minutes, and uses a pause of 1.5 seconds to trigger a split. You can run the script directly with Python or use uv.
 
-```python main.py \--minutes 30 \--pause-seconds 1.5  ``` <br>
+```python main.py --minutes 30 --pause-seconds 1.5  ``` <br>
 \# or  
-```uv run main.py \-- \--minutes 30 \--pause-seconds 1.5```
+```uv run main.py -- --minutes 30 --pause-seconds 1.5```
 
 ### **Command-Line Arguments**
 
@@ -82,3 +82,4 @@ This project is licensed under the
 LICENSENAME
 
 * see the [LICENSE.md](http://docs.google.com/LICENSE.md) file for details.
+
