@@ -21,11 +21,12 @@ Example
 python segment_recorder.py --minutes 30 --pause-seconds 1.5 --sr 48000 --silence-threshold 0.008
 """
 
+
 import argparse
 import csv
 import datetime as dt
 import math
-import os
+import re
 import queue
 import signal
 import subprocess
@@ -165,11 +166,22 @@ class SessionIO:
         self.delete_wav = delete_wav
         self.sr = sr
 
+        m3u_path = base_pattern
+        for i in ["C", "D", "T", "d", "t", "E", "e", "L", "l"]:
+            m3u_path = m3u_path.replace(f"~{i}", f"")
+        m3u_path = re.sub(re.compile(r"_+[^_]*$"), "_", m3u_path)
+
         # Sidecar file paths, include overall start tag for uniqueness
-        session_tag = f"{ts_to_date(overall_start_ts)}{ts_to_time(overall_start_ts)}"
-        self.csv_path = outdir / f"segments_{session_tag}.csv"
-        self.m3u_mp3_path = outdir / f"playlist_mp3_{session_tag}.m3u"
-        self.m3u_wav_path = outdir / f"playlist_wav_{session_tag}.m3u"
+        session_tag = f"{ts_to_date(overall_start_ts)}_{ts_to_time(overall_start_ts)}"
+        self.csv_path = outdir / f"{m3u_path}_segments_{session_tag}.csv".replace(
+            "__", "_"
+        )
+        self.m3u_mp3_path = outdir / f"{m3u_path}_pl_mp3_{session_tag}.m3u".replace(
+            "__", "_"
+        )
+        self.m3u_wav_path = outdir / f"{m3u_path}_pl_wav_{session_tag}.m3u".replace(
+            "__", "_"
+        )
 
         ensure_file_exists(
             self.csv_path,
@@ -318,10 +330,12 @@ class ContinuousRecorder:
         max_total_minutes: float | None = None,
         spectrogram_frequency: float = 0.6,
         spectrogram_colors: str | None = None,
+        start_seg_number: int = 0,
     ):
         self._epoch0 = None  # UNIX epoch baseline
         self._mono0 = None  # perf_counter baseline
         self._pa0 = None  # PortAudio time baseline (if available)
+        self.start_seg_number = start_seg_number
         self.minutes = minutes
         self.pause_seconds = pause_seconds
         self.sr = sr
@@ -451,10 +465,12 @@ class ContinuousRecorder:
             samples, t0, t1 = collected
             seg_idx = self._segment_index
             self._segment_index += 1
-            self._task_q.put((samples.copy(), self.sr, t0, t1, seg_idx))
+            self._task_q.put(
+                (samples.copy(), self.sr, t0, t1, seg_idx + self.start_seg_number)
+            )
             print(
                 ("\n" if self.spec_freq > 0.0 else "")
-                + f"[INFO] Segment cut ({reason}). idx={seg_idx:04d}  samples:{len(samples)}",
+                + f"[INFO] Segment cut ({reason}). idx={seg_idx+self.start_seg_number:04d}  samples:{len(samples)}",
                 flush=True,
             )
 
@@ -716,6 +732,12 @@ def main():
         help="Frames per block callback (default: 2048)",
     )
     ap.add_argument(
+        "--start-seg-number",
+        type=int,
+        default=0,
+        help="Starting segment number for file naming (default: 0)",
+    )
+    ap.add_argument(
         "--device",
         type=str,
         default=None,
@@ -795,6 +817,7 @@ def main():
         max_total_minutes=args.max_total_minutes,
         spectrogram_frequency=args.specrogram_frequency,
         spectrogram_colors=args.specrogram_colors,
+        start_seg_number=args.start_seg_number,
     )
 
     def _handle_sig(signum, frame):

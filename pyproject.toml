@@ -4,4 +4,10 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["sounddevice", "numpy", "scipy", "matplotlib"]
+dependencies = [
+    "sounddevice",
+ "numpy",
+ "scipy",
+ "matplotlib",
+ "soundfile>=0.13.1",
+]
