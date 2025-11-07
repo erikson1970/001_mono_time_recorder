@@ -14,3 +14,4 @@ recordings/*
 
 # macOS specific files
 .DS_Store   
+.stignore
