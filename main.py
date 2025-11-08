@@ -35,7 +35,7 @@ import threading
 import time
 import shutil
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import sounddevice as sd
@@ -44,8 +44,16 @@ import soundfile as sf
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
-# Prepare the jet colormap
-JET_CMAP = cm.get_cmap("jet")
+# Local imports
+from command import Command, CommandQueue, StdinReader, print_hotkey_help
+from timing import SessionTimer
+
+# Prepare the jet colormap (use new matplotlib API)
+try:
+    JET_CMAP = cm.get_cmap("jet")  # matplotlib < 3.7
+except AttributeError:
+    import matplotlib.pyplot as plt
+    JET_CMAP = plt.get_cmap("jet")  # matplotlib >= 3.7
 
 
 def ts_to_date(ts: float) -> str:  # DDMMYY
@@ -159,12 +167,18 @@ class SessionIO:
         overall_start_ts: float,
         delete_wav: bool,
         sr: int,
+        min_duration: float = 1.0,
     ):
         self.outdir = outdir
         self.base_pattern = base_pattern
         self.overall_start_ts = overall_start_ts
         self.delete_wav = delete_wav
         self.sr = sr
+        self.min_duration = min_duration
+
+        # Track encoder processes for graceful shutdown
+        self._encoder_lock = threading.Lock()
+        self._encoder_processes: List[Tuple[subprocess.Popen, Path, Path]] = []  # (process, wav, mp3)
 
         m3u_path = base_pattern
         for i in ["C", "D", "T", "d", "t", "E", "e", "L", "l"]:
@@ -235,6 +249,15 @@ class SessionIO:
         self, samples: np.ndarray, t0: float, t1: float, seg_idx: int
     ):
         seg_len = max(0.0, (len(samples) / self.sr))  # or (t1 - t0)
+
+        # Skip segments shorter than minimum duration
+        if seg_len < self.min_duration:
+            print(
+                f"[INFO] Skipping segment {seg_idx} (duration {seg_len:.2f}s < min {self.min_duration:.2f}s)",
+                file=sys.stderr,
+            )
+            return
+
         base = self._format_base(seg_idx, t0, t1, seg_len)
         wav_path = self.outdir / f"{base}.wav"
         mp3_path = self.outdir / f"{base}.mp3"
@@ -265,22 +288,58 @@ class SessionIO:
             with self.m3u_wav_path.open("a") as f:
                 f.write(f"{wav_path.name}\n")
 
-        # Spawn LAME encode
+        # Spawn LAME encode and track the process
         cmd = ["lame", "--preset", "mw-eu", "--quiet", str(wav_path), str(mp3_path)]
         try:
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with self._encoder_lock:
+                self._encoder_processes.append((proc, wav_path, mp3_path))
         except FileNotFoundError:
             print(
                 "[WARN] 'lame' not found in PATH; skipping MP3 encode.", file=sys.stderr
             )
 
-        # Optionally delete WAV immediately after spawning encode
-        if self.delete_wav:
-            time.sleep(0.2)
+    def join_encoders(self, timeout: float = 30.0):
+        """
+        Wait for all encoder processes to complete.
+
+        Args:
+            timeout: Maximum time to wait for each encoder (seconds)
+        """
+        with self._encoder_lock:
+            processes = list(self._encoder_processes)
+
+        if not processes:
+            return
+
+        print(f"[INFO] Waiting for {len(processes)} encoder(s) to complete...", flush=True)
+
+        for proc, wav_path, mp3_path in processes:
             try:
-                wav_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+                proc.wait(timeout=timeout)
+                if proc.returncode == 0:
+                    # Encode succeeded, optionally delete WAV
+                    if self.delete_wav and wav_path.exists():
+                        try:
+                            wav_path.unlink()
+                        except Exception as e:
+                            print(f"[WARN] Failed to delete {wav_path}: {e}", file=sys.stderr)
+                else:
+                    print(
+                        f"[WARN] Encoder failed for {wav_path.name} (code {proc.returncode})",
+                        file=sys.stderr,
+                    )
+            except subprocess.TimeoutExpired:
+                print(
+                    f"[WARN] Encoder timeout for {wav_path.name} after {timeout}s",
+                    file=sys.stderr,
+                )
+                proc.kill()
+
+        with self._encoder_lock:
+            self._encoder_processes.clear()
+
+        print("[INFO] All encoders completed.", flush=True)
 
 
 class SegmentWriter(threading.Thread):
@@ -331,6 +390,8 @@ class ContinuousRecorder:
         spectrogram_frequency: float = 0.6,
         spectrogram_colors: str | None = None,
         start_seg_number: int = 0,
+        min_segment_seconds: float = 1.0,
+        command_queue: Optional[CommandQueue] = None,
     ):
         self._epoch0 = None  # UNIX epoch baseline
         self._mono0 = None  # perf_counter baseline
@@ -341,10 +402,12 @@ class ContinuousRecorder:
         self.sr = sr
         self.blocksize = blocksize
         self.spec_freq = spectrogram_frequency
+        self.spec_enabled = spectrogram_frequency > 0.0
         self.device = device
         self.threshold = silence_rms_threshold
         self.output_dir = output_dir
         self.delete_wav_after_encode = delete_wav_after_encode
+        self.min_segment_seconds = min_segment_seconds
         self.max_pause_minutes = (
             math.ceil(0.1 * self.minutes)
             if max_pause_minutes is None
@@ -359,13 +422,20 @@ class ContinuousRecorder:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Command and timing
+        self.command_queue = command_queue
+        self.session_timer = SessionTimer()
+
+        # Pause state
+        self._pause_lock = threading.Lock()
+        self._is_paused = False
+
         self._lock = threading.Lock()
         self._active_frames: List[np.ndarray] = []
         self._active_start_ts: float | None = None
 
         self._elapsed_since_start = 0.0
         self._silence_run = 0.0
-        self._total_elapsed = 0.0
         self.spec_colors = spectrogram_colors
 
         self._eligible_for_split = False
@@ -383,6 +453,7 @@ class ContinuousRecorder:
             overall_start_ts=self._overall_start_ts,
             delete_wav=self.delete_wav_after_encode,
             sr=self.sr,
+            min_duration=self.min_segment_seconds,
         )
         self._task_q: "queue.Queue[Tuple[np.ndarray, int, float, float, int]]" = (
             queue.Queue()
@@ -469,7 +540,7 @@ class ContinuousRecorder:
                 (samples.copy(), self.sr, t0, t1, seg_idx + self.start_seg_number)
             )
             print(
-                ("\n" if self.spec_freq > 0.0 else "")
+                ("\n" if self.spec_enabled else "")
                 + f"[INFO] Segment cut ({reason}). idx={seg_idx+self.start_seg_number:04d}  samples:{len(samples)}",
                 flush=True,
             )
@@ -542,6 +613,11 @@ class ContinuousRecorder:
             if status:
                 print(f"[AudioStatus] {status}", file=sys.stderr)
 
+            # Check pause state - skip processing but keep stream alive
+            with self._pause_lock:
+                if self._is_paused:
+                    return
+
             # mono = np.ascontiguousarray(indata[:, 0], dtype=np.float32)
             mono = np.array(indata[:, 0], dtype=np.float32, copy=True)
 
@@ -559,21 +635,24 @@ class ContinuousRecorder:
 
             block_duration = frames / self.sr
             self._elapsed_since_start += block_duration
-            self._total_elapsed += block_duration
 
-            # Max total recording time logic
+            # Update session timer with active time
+            self.session_timer.add_active_time(block_duration)
+
+            # Max total recording time logic (using active time)
+            active_time_minutes = self.session_timer.get_active_time() / 60.0
             if (
-                self._total_elapsed >= self.max_total_minutes * 60.0
+                active_time_minutes >= self.max_total_minutes
                 and not self._request_stop
             ):
                 print(
-                    ("\n" if self.spec_freq > 0.0 else "")
-                    + f"[INFO] Max total time reached ({self.max_total_minutes} min). Forcing split and exit.",
+                    ("\n" if self.spec_enabled else "")
+                    + f"[INFO] Max active time reached ({self.max_total_minutes} min). Forcing split and exit.",
                     flush=True,
                 )
                 next_start = block_start_ts + block_duration
                 # Cut if we have enough to form a segment; otherwise just finalize whatever is there
-                self._cut_and_enqueue(next_start, reason="max total time")
+                self._cut_and_enqueue(next_start, reason="max active time")
                 self._request_stop = True
                 return
 
@@ -586,19 +665,19 @@ class ContinuousRecorder:
                 self._pause_watch_elapsed = 0.0
                 if not self._pause_notice_printed:
                     print(
-                        ("\n" if self.spec_freq > 0.0 else "")
+                        ("\n" if self.spec_enabled else "")
                         + f"[INFO] Segment length reached {self.minutes:.2f} min; looking for a pause "
                         f"(≥ {self.pause_seconds:.2f}s, thr={self.threshold}).",
                         flush=True,
                     )
                     print(
-                        ("\n" if self.spec_freq > 0.0 else "")
+                        ("\n" if self.spec_enabled else "")
                         + f"[INFO] Pause search window: up to {self.max_pause_minutes} minute(s) before forced cut.",
                         flush=True,
                     )
                     self._pause_notice_printed = True
 
-            if self.spec_freq > 0.0 and np.random.rand() < self.spec_freq:
+            if self.spec_enabled and np.random.rand() < self.spec_freq:
                 NN = min(len(indata[:, 0]), 2048)
                 if NN > 0:
                     # Show spectrogram in the console
@@ -622,7 +701,7 @@ class ContinuousRecorder:
                 if self._pause_watch_elapsed >= self.max_pause_minutes * 60.0:
                     if not self._pause_expire_notice_printed:
                         print(
-                            ("\n" if self.spec_freq > 0.0 else "")
+                            ("\n" if self.spec_enabled else "")
                             + "[INFO] Pause search window expired—forcing segment cut.",
                             flush=True,
                         )
@@ -663,6 +742,57 @@ class ContinuousRecorder:
         if not self.delete_wav_after_encode:
             print(f"[INFO] WAV M3U: {self._io.m3u_wav_path.name}")
 
+    def toggle_pause(self):
+        """Toggle pause/resume state."""
+        with self._pause_lock:
+            if self._is_paused:
+                self._is_paused = False
+                self.session_timer.resume()
+                print("\n[INFO] Recording RESUMED", flush=True)
+            else:
+                self._is_paused = True
+                self.session_timer.pause()
+                print("\n[INFO] Recording PAUSED", flush=True)
+
+    def force_break_immediate(self):
+        """Force an immediate segment break."""
+        print("\n[INFO] Forcing immediate segment break...", flush=True)
+        # Set request to break on next callback
+        self._request_stop = True
+
+    def force_break_with_gap(self):
+        """Request break at next good gap (same as reaching target time)."""
+        print("\n[INFO] Forcing segment break at next gap...", flush=True)
+        if not self._eligible_for_split:
+            self._eligible_for_split = True
+            self._pause_watch_elapsed = 0.0
+
+    def toggle_spectrogram(self):
+        """Toggle spectrogram display."""
+        self.spec_enabled = not self.spec_enabled
+        status = "ENABLED" if self.spec_enabled else "DISABLED"
+        print(f"\n[INFO] Spectrogram {status}", flush=True)
+
+    def show_gap_histogram(self):
+        """Show current gap histogram (placeholder for Phase 2)."""
+        print("\n[INFO] Gap histogram not yet implemented (Phase 2 feature)", flush=True)
+
+    def process_command(self, cmd: Command):
+        """Process a command from the command queue."""
+        if cmd == Command.QUIT:
+            print("\n[INFO] Quit command received", flush=True)
+            self._request_stop = True
+        elif cmd == Command.PAUSE_RESUME:
+            self.toggle_pause()
+        elif cmd == Command.BREAK_IMMEDIATE:
+            self.force_break_immediate()
+        elif cmd == Command.BREAK_WITH_GAP:
+            self.force_break_with_gap()
+        elif cmd == Command.TOGGLE_SPECTROGRAM:
+            self.toggle_spectrogram()
+        elif cmd == Command.SHOW_HISTOGRAM:
+            self.show_gap_histogram()
+
     def stop(self):
         self._stop_event.set()
         if self._stream:
@@ -687,15 +817,24 @@ class ContinuousRecorder:
             pass
         self._writer.stop()
 
+        # Wait for all encoders to complete
+        self._io.join_encoders()
+
     def wait_forever(self):
         try:
             while not self._stop_event.is_set():
+                # Process commands if command queue is available
+                if self.command_queue:
+                    cmd = self.command_queue.get(block=False, timeout=0.1)
+                    if cmd:
+                        self.process_command(cmd)
+
                 if self._request_stop:
                     # Give the queue a moment to drain, then stop
                     time.sleep(0.5)
                     self.stop()
                     break
-                time.sleep(0.5)
+                time.sleep(0.1)
         except KeyboardInterrupt:
             print("\n[INFO] Stopping…")
             self.stop()
@@ -760,7 +899,12 @@ def main():
         action="store_true",
         help="Delete WAV after spawning MP3 encode",
     )
-
+    ap.add_argument(
+        "--min-segment-seconds",
+        type=float,
+        default=1.0,
+        help="Minimum segment duration in seconds (default: 1.0). Shorter segments are skipped.",
+    )
     ap.add_argument(
         "--specrogram-frequency",
         type=float,
@@ -798,10 +942,24 @@ def main():
         default=None,
         help="Max total recording time before exit (minutes). Default ceil(10×--minutes).",
     )
+    ap.add_argument(
+        "--no-hotkeys",
+        action="store_true",
+        help="Disable interactive hotkeys (Ctrl+C only)",
+    )
     args = ap.parse_args()
 
     if args.list_devices:
         list_devices_and_exit()
+
+    # Setup command infrastructure
+    cmd_queue = None
+    stdin_reader = None
+    if not args.no_hotkeys:
+        cmd_queue = CommandQueue()
+        stdin_reader = StdinReader(cmd_queue)
+        stdin_reader.start()
+        print_hotkey_help()
 
     rec = ContinuousRecorder(
         minutes=args.minutes,
@@ -818,10 +976,14 @@ def main():
         spectrogram_frequency=args.specrogram_frequency,
         spectrogram_colors=args.specrogram_colors,
         start_seg_number=args.start_seg_number,
+        min_segment_seconds=args.min_segment_seconds,
+        command_queue=cmd_queue,
     )
 
     def _handle_sig(signum, frame):
         print("\n[INFO] Signal received, shutting down…")
+        if stdin_reader:
+            stdin_reader.stop()
         rec.stop()
         sys.exit(0)
 
@@ -830,6 +992,9 @@ def main():
 
     rec.start()
     rec.wait_forever()
+
+    if stdin_reader:
+        stdin_reader.stop()
 
 
 if __name__ == "__main__":

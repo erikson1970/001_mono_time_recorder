@@ -11,6 +11,10 @@ wheels/
 
 # recordings files
 recordings/*
+test_recordings/*
+*.wav
+*.mp3
+*.m3u
 
 # macOS specific files
 .DS_Store   
