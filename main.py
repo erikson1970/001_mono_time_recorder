@@ -45,15 +45,23 @@ import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
 # Local imports
-from command import Command, CommandQueue, StdinReader, print_hotkey_help
+from command import (
+    Command,
+    CommandMode,
+    print_command_menu_help,
+    print_startup_help,
+    read_command,
+)
 from timing import SessionTimer
 
-# Prepare the jet colormap (use new matplotlib API)
+# Prepare the jet colormap (use new matplotlib API >= 3.7)
 try:
-    JET_CMAP = cm.get_cmap("jet")  # matplotlib < 3.7
-except AttributeError:
-    import matplotlib.pyplot as plt
-    JET_CMAP = plt.get_cmap("jet")  # matplotlib >= 3.7
+    # Try new API first (matplotlib >= 3.7)
+    import matplotlib
+    JET_CMAP = matplotlib.colormaps.get_cmap("jet")
+except (AttributeError, KeyError):
+    # Fall back to old API (matplotlib < 3.7)
+    JET_CMAP = cm.get_cmap("jet")
 
 
 def ts_to_date(ts: float) -> str:  # DDMMYY
@@ -391,7 +399,8 @@ class ContinuousRecorder:
         spectrogram_colors: str | None = None,
         start_seg_number: int = 0,
         min_segment_seconds: float = 1.0,
-        command_queue: Optional[CommandQueue] = None,
+        start_paused: bool = False,
+        monitor_mode: bool = False,
     ):
         self._epoch0 = None  # UNIX epoch baseline
         self._mono0 = None  # perf_counter baseline
@@ -422,13 +431,22 @@ class ContinuousRecorder:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Command and timing
-        self.command_queue = command_queue
+        # Command mode and timing
+        self.command_mode = CommandMode()
         self.session_timer = SessionTimer()
 
-        # Pause state
+        # Pause and monitor mode state
         self._pause_lock = threading.Lock()
-        self._is_paused = False
+        self._is_paused = start_paused
+        self._monitor_mode = monitor_mode  # Spectrogram on while paused
+
+        if start_paused:
+            self.session_timer.pause()
+
+        if monitor_mode:
+            self._is_paused = True
+            self.spec_enabled = True
+            self.session_timer.pause()
 
         self._lock = threading.Lock()
         self._active_frames: List[np.ndarray] = []
@@ -613,10 +631,18 @@ class ContinuousRecorder:
             if status:
                 print(f"[AudioStatus] {status}", file=sys.stderr)
 
-            # Check pause state - skip processing but keep stream alive
+            # Check pause state - handle monitor mode
             with self._pause_lock:
-                if self._is_paused:
-                    return
+                is_paused = self._is_paused
+                monitor_mode = self._monitor_mode
+
+            # If paused, only show spectrogram in monitor mode, then skip recording
+            if is_paused:
+                if monitor_mode and self.spec_enabled and np.random.rand() < self.spec_freq:
+                    NN = min(len(indata[:, 0]), 2048)
+                    if NN > 0:
+                        self.show_spectrogram(indata[:NN, 0].copy(), N=NN)
+                return  # Skip recording when paused
 
             # mono = np.ascontiguousarray(indata[:, 0], dtype=np.float32)
             mono = np.array(indata[:, 0], dtype=np.float32, copy=True)
@@ -711,8 +737,19 @@ class ContinuousRecorder:
                     return
 
             # If stop requested (e.g., after max total time), finalize ASAP
+            # But only finalize once, then skip all subsequent callbacks
             if self._request_stop:
+                # Check if we've already finalized by seeing if buffer is empty
+                with self._lock:
+                    if self._active_frames:
+                        # First callback after stop request - finalize
+                        pass  # Will finalize outside the lock
+                    else:
+                        # Already finalized, skip this callback
+                        return
+
                 self._force_finalize_current()
+                return  # Don't process any more callbacks
 
         except Exception as e:
             print(f"[CallbackError] {e}", file=sys.stderr)
@@ -742,17 +779,28 @@ class ContinuousRecorder:
         if not self.delete_wav_after_encode:
             print(f"[INFO] WAV M3U: {self._io.m3u_wav_path.name}")
 
-    def toggle_pause(self):
-        """Toggle pause/resume state."""
+    def pause(self):
+        """Pause recording."""
+        with self._pause_lock:
+            if not self._is_paused:
+                self._is_paused = True
+                self.session_timer.pause()
+                print("\n[INFO] Recording PAUSED", flush=True)
+
+    def resume(self):
+        """Resume recording."""
         with self._pause_lock:
             if self._is_paused:
                 self._is_paused = False
                 self.session_timer.resume()
                 print("\n[INFO] Recording RESUMED", flush=True)
-            else:
-                self._is_paused = True
-                self.session_timer.pause()
-                print("\n[INFO] Recording PAUSED", flush=True)
+
+    def toggle_monitor_mode(self):
+        """Toggle monitor mode (spectrogram on while paused)."""
+        with self._pause_lock:
+            self._monitor_mode = not self._monitor_mode
+            status = "ENABLED" if self._monitor_mode else "DISABLED"
+            print(f"\n[INFO] Monitor mode {status}", flush=True)
 
     def force_break_immediate(self):
         """Force an immediate segment break."""
@@ -777,21 +825,48 @@ class ContinuousRecorder:
         """Show current gap histogram (placeholder for Phase 2)."""
         print("\n[INFO] Gap histogram not yet implemented (Phase 2 feature)", flush=True)
 
+    def print_status(self):
+        """Print current recording status."""
+        active_time = self.session_timer.get_active_time()
+        total_time = self.session_timer.get_total_time()
+        active_mins = active_time / 60.0
+        total_mins = total_time / 60.0
+
+        with self._pause_lock:
+            paused = self._is_paused
+            monitor = self._monitor_mode
+
+        status_lines = [
+            "╔═══════════════════════ STATUS ═══════════════════════════╗",
+            f"║  Segment: {self._segment_index:04d}                                              ║",
+            f"║  Active time: {active_mins:.1f} / {self.max_total_minutes:.1f} min                    ║",
+            f"║  Total time:  {total_mins:.1f} min                                  ║",
+            f"║  Recording: {'PAUSED' if paused else 'ACTIVE'}                                     ║",
+            f"║  Monitor mode: {'ON' if monitor else 'OFF'}                                  ║",
+            f"║  Spectrogram: {'ON' if self.spec_enabled else 'OFF'}                              ║",
+            "╚══════════════════════════════════════════════════════════╝",
+        ]
+        print("\n".join(status_lines), flush=True)
+
     def process_command(self, cmd: Command):
-        """Process a command from the command queue."""
+        """Process a command from the command menu."""
         if cmd == Command.QUIT:
             print("\n[INFO] Quit command received", flush=True)
             self._request_stop = True
-        elif cmd == Command.PAUSE_RESUME:
-            self.toggle_pause()
+        elif cmd == Command.RESUME:
+            self.resume()
         elif cmd == Command.BREAK_IMMEDIATE:
             self.force_break_immediate()
         elif cmd == Command.BREAK_WITH_GAP:
             self.force_break_with_gap()
         elif cmd == Command.TOGGLE_SPECTROGRAM:
             self.toggle_spectrogram()
+        elif cmd == Command.TOGGLE_MONITOR:
+            self.toggle_monitor_mode()
         elif cmd == Command.SHOW_HISTOGRAM:
             self.show_gap_histogram()
+        elif cmd == Command.SHOW_HELP:
+            print_command_menu_help()
 
     def stop(self):
         self._stop_event.set()
@@ -820,24 +895,73 @@ class ContinuousRecorder:
         # Wait for all encoders to complete
         self._io.join_encoders()
 
+    def enter_command_mode(self):
+        """Enter command mode: pause recording and show command menu."""
+        self.pause()
+        self.command_mode.enter()
+        print("\n")
+        self.print_status()
+        print("\n? for help, ENTER to resume, q to quit")
+        print("> ", end="", flush=True)
+
+    def exit_command_mode(self):
+        """Exit command mode."""
+        self.command_mode.exit()
+
     def wait_forever(self):
+        """
+        Main loop that handles command mode.
+
+        Ctrl+C enters command mode (pauses recording).
+        In command mode, read commands from stdin until RESUME or QUIT.
+        """
         try:
             while not self._stop_event.is_set():
-                # Process commands if command queue is available
-                if self.command_queue:
-                    cmd = self.command_queue.get(block=False, timeout=0.1)
-                    if cmd:
-                        self.process_command(cmd)
-
+                # Check if stop was requested
                 if self._request_stop:
                     # Give the queue a moment to drain, then stop
                     time.sleep(0.5)
                     self.stop()
                     break
+
+                # Sleep briefly to avoid busy-wait
                 time.sleep(0.1)
+
         except KeyboardInterrupt:
-            print("\n[INFO] Stopping…")
-            self.stop()
+            # Ctrl+C enters command mode
+            self.enter_command_mode()
+
+            # Command mode loop
+            while self.command_mode.is_active():
+                try:
+                    cmd = read_command()
+                    if cmd:
+                        self.process_command(cmd)
+
+                        if cmd == Command.QUIT:
+                            self.exit_command_mode()
+                            self.stop()
+                            return
+                        elif cmd == Command.RESUME:
+                            self.exit_command_mode()
+                            print("[INFO] Resuming recording...")
+                            # Continue outer loop
+                            break
+                        else:
+                            # Show prompt again for next command
+                            print("> ", end="", flush=True)
+
+                except KeyboardInterrupt:
+                    # Second Ctrl+C in command mode = quit
+                    print("\n[INFO] Double Ctrl+C - quitting...")
+                    self.exit_command_mode()
+                    self.stop()
+                    return
+
+            # Exited command mode, continue recording
+            if not self._stop_event.is_set() and not self._request_stop:
+                # Recursive call to continue waiting (and handle future Ctrl+C)
+                self.wait_forever()
 
 
 def list_devices_and_exit():
@@ -943,23 +1067,33 @@ def main():
         help="Max total recording time before exit (minutes). Default ceil(10×--minutes).",
     )
     ap.add_argument(
-        "--no-hotkeys",
+        "--start-paused",
         action="store_true",
-        help="Disable interactive hotkeys (Ctrl+C only)",
+        help="Start with recording paused (use Ctrl+C to enter command menu and resume)",
+    )
+    ap.add_argument(
+        "--no-spectrogram",
+        action="store_true",
+        help="Start with spectrogram hidden (can be toggled with 's' command)",
+    )
+    ap.add_argument(
+        "--monitor-mode",
+        action="store_true",
+        help="Start in monitor mode: paused with spectrogram visible",
     )
     args = ap.parse_args()
 
     if args.list_devices:
         list_devices_and_exit()
 
-    # Setup command infrastructure
-    cmd_queue = None
-    stdin_reader = None
-    if not args.no_hotkeys:
-        cmd_queue = CommandQueue()
-        stdin_reader = StdinReader(cmd_queue)
-        stdin_reader.start()
-        print_hotkey_help()
+    # Handle spectrogram settings
+    spec_freq = args.specrogram_frequency
+    if args.no_spectrogram:
+        spec_freq = 0.0  # Disable spectrogram at start
+
+    # Handle monitor mode (overrides start-paused)
+    monitor_mode = args.monitor_mode
+    start_paused = args.start_paused or monitor_mode
 
     rec = ContinuousRecorder(
         minutes=args.minutes,
@@ -973,28 +1107,25 @@ def main():
         max_pause_minutes=args.max_pause_minutes,
         base_filename=args.base_filename,
         max_total_minutes=args.max_total_minutes,
-        spectrogram_frequency=args.specrogram_frequency,
+        spectrogram_frequency=spec_freq,
         spectrogram_colors=args.specrogram_colors,
         start_seg_number=args.start_seg_number,
         min_segment_seconds=args.min_segment_seconds,
-        command_queue=cmd_queue,
+        start_paused=start_paused,
+        monitor_mode=monitor_mode,
     )
 
     def _handle_sig(signum, frame):
-        print("\n[INFO] Signal received, shutting down…")
-        if stdin_reader:
-            stdin_reader.stop()
+        print("\n[INFO] SIGTERM received, shutting down…")
         rec.stop()
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, _handle_sig)
+    # Only handle SIGTERM - let KeyboardInterrupt (Ctrl+C) be caught by wait_forever
     signal.signal(signal.SIGTERM, _handle_sig)
 
+    print_startup_help()
     rec.start()
     rec.wait_forever()
-
-    if stdin_reader:
-        stdin_reader.stop()
 
 
 if __name__ == "__main__":

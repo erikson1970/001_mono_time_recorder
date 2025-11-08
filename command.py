@@ -15,11 +15,14 @@ from typing import Optional
 class Command(Enum):
     """Available commands during recording."""
     QUIT = 'q'
-    PAUSE_RESUME = 'p'
+    RESUME = ''  # Empty string = just hit ENTER
     BREAK_WITH_GAP = 'b'
     BREAK_IMMEDIATE = 'B'
     SHOW_HISTOGRAM = 'h'
     TOGGLE_SPECTROGRAM = 's'
+    TOGGLE_MONITOR = 'm'  # Monitor mode: spectrogram on, recording paused
+    SHOW_HELP = '?'
+    ENTER_COMMAND_MODE = '\x03'  # Ctrl+C
 
 
 class CommandQueue:
@@ -56,112 +59,109 @@ class CommandQueue:
                 break
 
 
-class StdinReader(threading.Thread):
+class CommandMode:
     """
-    Background thread that reads from stdin and enqueues commands.
+    Command mode state - entered via Ctrl+C, exited via ENTER or quit.
 
-    Attempts to use readchar for single-key input (no Enter required).
-    Falls back to line-based input if readchar is unavailable.
+    When in command mode:
+    - Recording is paused
+    - User can enter single-key commands
+    - ENTER resumes recording
+    - 'q' or second Ctrl+C quits
     """
 
-    def __init__(self, cmd_queue: CommandQueue):
-        super().__init__(daemon=True, name="StdinReader")
-        self.cmd_queue = cmd_queue
-        self._stop_event = threading.Event()
-        self._use_readchar = False
+    def __init__(self):
+        self._in_command_mode = False
+        self._lock = threading.Lock()
 
-        # Try to import readchar
-        try:
-            import readchar
-            self._readchar = readchar
-            self._use_readchar = True
-        except ImportError:
-            self._readchar = None
+    def enter(self):
+        """Enter command mode."""
+        with self._lock:
+            self._in_command_mode = True
 
-    def stop(self):
-        """Request thread to stop."""
-        self._stop_event.set()
+    def exit(self):
+        """Exit command mode."""
+        with self._lock:
+            self._in_command_mode = False
 
-    def _read_single_char(self) -> Optional[str]:
-        """Read a single character using readchar."""
-        try:
-            ch = self._readchar.readchar()
-            return ch
-        except Exception:
-            return None
-
-    def _read_line(self) -> Optional[str]:
-        """Read a line from stdin."""
-        try:
-            line = sys.stdin.readline()
-            if line:
-                return line.strip()
-            return None
-        except Exception:
-            return None
-
-    def _parse_command(self, input_str: str) -> Optional[Command]:
-        """Parse input string to Command enum."""
-        if not input_str:
-            return None
-
-        # Take first character
-        ch = input_str[0].lower() if input_str else ''
-
-        # Map to command
-        command_map = {
-            'q': Command.QUIT,
-            'p': Command.PAUSE_RESUME,
-            'b': Command.BREAK_WITH_GAP,
-            'B': Command.BREAK_IMMEDIATE,
-            'h': Command.SHOW_HISTOGRAM,
-            's': Command.TOGGLE_SPECTROGRAM,
-        }
-
-        # Handle uppercase B specially
-        if input_str[0] == 'B':
-            return Command.BREAK_IMMEDIATE
-
-        return command_map.get(ch)
-
-    def run(self):
-        """Main loop: read from stdin and enqueue commands."""
-        if self._use_readchar:
-            self._run_readchar()
-        else:
-            self._run_line_based()
-
-    def _run_readchar(self):
-        """Run loop with single-character input (readchar)."""
-        while not self._stop_event.is_set():
-            ch = self._read_single_char()
-            if ch:
-                cmd = self._parse_command(ch)
-                if cmd:
-                    self.cmd_queue.put(cmd, block=False)
-
-    def _run_line_based(self):
-        """Run loop with line-based input (fallback)."""
-        while not self._stop_event.is_set():
-            line = self._read_line()
-            if line:
-                cmd = self._parse_command(line)
-                if cmd:
-                    self.cmd_queue.put(cmd, block=False)
+    def is_active(self) -> bool:
+        """Check if in command mode."""
+        with self._lock:
+            return self._in_command_mode
 
 
-def print_hotkey_help():
-    """Print available hotkeys to console."""
+# No background stdin reader needed - Ctrl+C is handled by signal handler
+# and command reading happens synchronously in main loop when in command mode
+
+
+def print_command_menu_help():
+    """Print command menu help (shown when entering command mode)."""
     help_text = """
-╔══════════════════════════════════════════════════════════╗
-║                   HOTKEY COMMANDS                        ║
-╠══════════════════════════════════════════════════════════╣
-║  q  │ Quit - Stop recording and exit gracefully          ║
-║  p  │ Pause/Resume - Toggle recording pause              ║
-║  b  │ Break with gap - Cut segment at next good gap      ║
-║  B  │ Break immediate - Force segment cut now            ║
-║  h  │ Histogram - Show current gap histogram (if enabled)║
-║  s  │ Toggle spectrogram - Show/hide spectrogram         ║
-╚══════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════╗
+║                    COMMAND MENU                           ║
+╠═══════════════════════════════════════════════════════════╣
+║  ?      │ Show this help                                  ║
+║  ENTER  │ Resume recording                                ║
+║  q      │ Quit - Stop recording and exit gracefully       ║
+║  b      │ Break with gap - Cut segment at next good gap   ║
+║  B      │ Break immediate - Force segment cut now         ║
+║  h      │ Histogram - Show current gap histogram          ║
+║  s      │ Toggle spectrogram - Show/hide spectrogram      ║
+║  m      │ Monitor mode - Toggle spectrogram while paused  ║
+╚═══════════════════════════════════════════════════════════╝
 """
     print(help_text, flush=True)
+
+
+def print_startup_help():
+    """Print startup help message."""
+    help_text = """
+╔═══════════════════════════════════════════════════════════╗
+║  Press Ctrl+C to pause and enter command menu             ║
+║  In command menu: ? for help, ENTER to resume, q to quit  ║
+╚═══════════════════════════════════════════════════════════╝
+"""
+    print(help_text, flush=True)
+
+
+def parse_command(input_str: str) -> Optional[Command]:
+    """Parse input string to Command enum."""
+    if not input_str or input_str == '\n':
+        return Command.RESUME
+
+    # Take first character
+    ch = input_str[0] if input_str else ''
+
+    # Map to command
+    command_map = {
+        'q': Command.QUIT,
+        'b': Command.BREAK_WITH_GAP,
+        'B': Command.BREAK_IMMEDIATE,
+        'h': Command.SHOW_HISTOGRAM,
+        's': Command.TOGGLE_SPECTROGRAM,
+        'm': Command.TOGGLE_MONITOR,
+        '?': Command.SHOW_HELP,
+        '': Command.RESUME,
+    }
+
+    # Handle uppercase B specially
+    if ch == 'B':
+        return Command.BREAK_IMMEDIATE
+
+    return command_map.get(ch.lower())
+
+
+def read_command() -> Optional[Command]:
+    """
+    Read a single command from stdin (blocking).
+
+    Returns None if interrupted or EOF.
+    """
+    try:
+        line = input()  # Blocking read with prompt support
+        return parse_command(line)
+    except (EOFError, KeyboardInterrupt):
+        # Second Ctrl+C while in command mode = quit
+        return Command.QUIT
+    except Exception:
+        return None
