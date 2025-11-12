@@ -58,6 +58,7 @@ from timing import SessionTimer
 try:
     # Try new API first (matplotlib >= 3.7)
     import matplotlib
+
     JET_CMAP = matplotlib.colormaps.get_cmap("jet")
 except (AttributeError, KeyError):
     # Fall back to old API (matplotlib < 3.7)
@@ -186,7 +187,9 @@ class SessionIO:
 
         # Track encoder processes for graceful shutdown
         self._encoder_lock = threading.Lock()
-        self._encoder_processes: List[Tuple[subprocess.Popen, Path, Path]] = []  # (process, wav, mp3)
+        self._encoder_processes: List[Tuple[subprocess.Popen, Path, Path]] = (
+            []
+        )  # (process, wav, mp3)
 
         m3u_path = base_pattern
         for i in ["C", "D", "T", "d", "t", "E", "e", "L", "l"]:
@@ -299,7 +302,9 @@ class SessionIO:
         # Spawn LAME encode and track the process
         cmd = ["lame", "--preset", "mw-eu", "--quiet", str(wav_path), str(mp3_path)]
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
             with self._encoder_lock:
                 self._encoder_processes.append((proc, wav_path, mp3_path))
         except FileNotFoundError:
@@ -320,7 +325,9 @@ class SessionIO:
         if not processes:
             return
 
-        print(f"[INFO] Waiting for {len(processes)} encoder(s) to complete...", flush=True)
+        print(
+            f"[INFO] Waiting for {len(processes)} encoder(s) to complete...", flush=True
+        )
 
         for proc, wav_path, mp3_path in processes:
             try:
@@ -331,7 +338,10 @@ class SessionIO:
                         try:
                             wav_path.unlink()
                         except Exception as e:
-                            print(f"[WARN] Failed to delete {wav_path}: {e}", file=sys.stderr)
+                            print(
+                                f"[WARN] Failed to delete {wav_path}: {e}",
+                                file=sys.stderr,
+                            )
                 else:
                     print(
                         f"[WARN] Encoder failed for {wav_path.name} (code {proc.returncode})",
@@ -355,7 +365,7 @@ class SegmentWriter(threading.Thread):
 
     def __init__(
         self,
-        task_q: "queue.Queue[Tuple[np.ndarray, int, float, float, int]]",
+        task_q: queue.Queue[Tuple[np.ndarray, int, float, float, int]],
         io: SessionIO,
     ):
         super().__init__(daemon=True)
@@ -440,13 +450,10 @@ class ContinuousRecorder:
         self._is_paused = start_paused
         self._monitor_mode = monitor_mode  # Spectrogram on while paused
 
-        if start_paused:
-            self.session_timer.pause()
-
+        # Monitor mode implies paused + spectrogram enabled
         if monitor_mode:
             self._is_paused = True
             self.spec_enabled = True
-            self.session_timer.pause()
 
         self._lock = threading.Lock()
         self._active_frames: List[np.ndarray] = []
@@ -473,7 +480,7 @@ class ContinuousRecorder:
             sr=self.sr,
             min_duration=self.min_segment_seconds,
         )
-        self._task_q: "queue.Queue[Tuple[np.ndarray, int, float, float, int]]" = (
+        self._task_q: queue.Queue[Tuple[np.ndarray, int, float, float, int]] = (
             queue.Queue()
         )
         self._writer = SegmentWriter(self._task_q, self._io)
@@ -575,6 +582,8 @@ class ContinuousRecorder:
                 f"[INFO] Finalizing current segment and stopping. idx={seg_idx}",
                 flush=True,
             )
+            # Clear the buffer so we don't finalize again
+            self._reset_active_buffer()
         self._request_stop = True
 
     def show_spectrogram(self, indata, N: int = 1):
@@ -638,7 +647,11 @@ class ContinuousRecorder:
 
             # If paused, only show spectrogram in monitor mode, then skip recording
             if is_paused:
-                if monitor_mode and self.spec_enabled and np.random.rand() < self.spec_freq:
+                if (
+                    monitor_mode
+                    and self.spec_enabled
+                    and np.random.rand() < self.spec_freq
+                ):
                     NN = min(len(indata[:, 0]), 2048)
                     if NN > 0:
                         self.show_spectrogram(indata[:NN, 0].copy(), N=NN)
@@ -667,10 +680,7 @@ class ContinuousRecorder:
 
             # Max total recording time logic (using active time)
             active_time_minutes = self.session_timer.get_active_time() / 60.0
-            if (
-                active_time_minutes >= self.max_total_minutes
-                and not self._request_stop
-            ):
+            if active_time_minutes >= self.max_total_minutes and not self._request_stop:
                 print(
                     ("\n" if self.spec_enabled else "")
                     + f"[INFO] Max active time reached ({self.max_total_minutes} min). Forcing split and exit.",
@@ -737,19 +747,10 @@ class ContinuousRecorder:
                     return
 
             # If stop requested (e.g., after max total time), finalize ASAP
-            # But only finalize once, then skip all subsequent callbacks
+            # _force_finalize_current() clears the buffer, so subsequent calls are no-ops
             if self._request_stop:
-                # Check if we've already finalized by seeing if buffer is empty
-                with self._lock:
-                    if self._active_frames:
-                        # First callback after stop request - finalize
-                        pass  # Will finalize outside the lock
-                    else:
-                        # Already finalized, skip this callback
-                        return
-
                 self._force_finalize_current()
-                return  # Don't process any more callbacks
+                return  # Don't process any more callbacks after finalize
 
         except Exception as e:
             print(f"[CallbackError] {e}", file=sys.stderr)
@@ -758,6 +759,14 @@ class ContinuousRecorder:
         print("[INFO] Starting writer thread…")
         self._writer.start()
         print("[INFO] Opening input stream…")
+
+        # Start session timer
+        self.session_timer.start()
+
+        # If we started paused, pause the timer immediately
+        if self._is_paused:
+            self.session_timer.pause()
+
         self._stream = sd.InputStream(
             samplerate=self.sr,
             channels=1,
@@ -823,7 +832,9 @@ class ContinuousRecorder:
 
     def show_gap_histogram(self):
         """Show current gap histogram (placeholder for Phase 2)."""
-        print("\n[INFO] Gap histogram not yet implemented (Phase 2 feature)", flush=True)
+        print(
+            "\n[INFO] Gap histogram not yet implemented (Phase 2 feature)", flush=True
+        )
 
     def print_status(self):
         """Print current recording status."""
@@ -836,14 +847,24 @@ class ContinuousRecorder:
             paused = self._is_paused
             monitor = self._monitor_mode
 
+        # Format with proper padding
+        status_text = f"Segment: {self._segment_index:04d}"
+        active_text = (
+            f"Active time: {active_mins:.1f} / {self.max_total_minutes:.1f} min"
+        )
+        total_text = f"Total time: {total_mins:.1f} min"
+        recording_text = f"Recording: {'PAUSED' if paused else 'ACTIVE'}"
+        monitor_text = f"Monitor mode: {'ON ' if monitor else 'OFF'}"
+        spec_text = f"Spectrogram: {'ON ' if self.spec_enabled else 'OFF'}"
+
         status_lines = [
-            "╔═══════════════════════ STATUS ═══════════════════════════╗",
-            f"║  Segment: {self._segment_index:04d}                                              ║",
-            f"║  Active time: {active_mins:.1f} / {self.max_total_minutes:.1f} min                    ║",
-            f"║  Total time:  {total_mins:.1f} min                                  ║",
-            f"║  Recording: {'PAUSED' if paused else 'ACTIVE'}                                     ║",
-            f"║  Monitor mode: {'ON' if monitor else 'OFF'}                                  ║",
-            f"║  Spectrogram: {'ON' if self.spec_enabled else 'OFF'}                              ║",
+            "╔══════════════════════════════════════════════════════════╗",
+            f"║  {status_text:<56}║",
+            f"║  {active_text:<56}║",
+            f"║  {total_text:<56}║",
+            f"║  {recording_text:<56}║",
+            f"║  {monitor_text:<56}║",
+            f"║  {spec_text:<56}║",
             "╚══════════════════════════════════════════════════════════╝",
         ]
         print("\n".join(status_lines), flush=True)
@@ -866,6 +887,9 @@ class ContinuousRecorder:
         elif cmd == Command.SHOW_HISTOGRAM:
             self.show_gap_histogram()
         elif cmd == Command.SHOW_HELP:
+            print_command_menu_help()
+        else:
+            print(f"\n[WARN] Unknown command: '{cmd}'")
             print_command_menu_help()
 
     def stop(self):
@@ -929,39 +953,40 @@ class ContinuousRecorder:
 
         except KeyboardInterrupt:
             # Ctrl+C enters command mode
+            # Pauses recording and shows the command menu
             self.enter_command_mode()
 
-            # Command mode loop
-            while self.command_mode.is_active():
-                try:
-                    cmd = read_command()
-                    if cmd:
-                        self.process_command(cmd)
+        # Command mode loop
+        while self.command_mode.is_active():
+            try:
+                cmd = read_command()
+                if cmd:
+                    self.process_command(cmd)
 
-                        if cmd == Command.QUIT:
-                            self.exit_command_mode()
-                            self.stop()
-                            return
-                        elif cmd == Command.RESUME:
-                            self.exit_command_mode()
-                            print("[INFO] Resuming recording...")
-                            # Continue outer loop
-                            break
-                        else:
-                            # Show prompt again for next command
-                            print("> ", end="", flush=True)
+                    if cmd == Command.QUIT:
+                        self.exit_command_mode()
+                        self.stop()
+                        return
+                    elif cmd == Command.RESUME:
+                        self.exit_command_mode()
+                        print("[INFO] Resuming recording...")
+                        # Continue outer loop
+                        break
+                    else:
+                        # Show prompt again for next command
+                        print("> ", end="", flush=True)
 
-                except KeyboardInterrupt:
-                    # Second Ctrl+C in command mode = quit
-                    print("\n[INFO] Double Ctrl+C - quitting...")
-                    self.exit_command_mode()
-                    self.stop()
-                    return
+            except KeyboardInterrupt:
+                # Second Ctrl+C in command mode = quit
+                print("\n[INFO] Double Ctrl+C - quitting...")
+                self.exit_command_mode()
+                self.stop()
+                return
 
-            # Exited command mode, continue recording
-            if not self._stop_event.is_set() and not self._request_stop:
-                # Recursive call to continue waiting (and handle future Ctrl+C)
-                self.wait_forever()
+        # Exited command mode, continue recording
+        if not self._stop_event.is_set() and not self._request_stop:
+            # Recursive call to continue waiting (and handle future Ctrl+C)
+            self.wait_forever()
 
 
 def list_devices_and_exit():
